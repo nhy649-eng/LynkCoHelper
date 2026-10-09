@@ -46,7 +46,6 @@ except ImportError:
 
 APP = "com.lynkco.customer"
 ACTIVITY = "com.lynkco.customer/com.geely.lynkco.main.activity.LynkCoEntranceActivity"
-CLASS = "com.safe.cons.LynkCoConstants$g"
 
 PROXY_PORT = 8700      # jdb -> 代理
 UPSTREAM_PORT = 8701   # 代理 -> adb forward -> jdwp:<pid>
@@ -919,7 +918,11 @@ def run_once():
         send_cmd(child, "suspend", timeout=_vt(10))
 
         print("\n[*] Setting breakpoint ...")
-        send_cmd(child, f"stop in {CLASS}.<clinit>", timeout=_vt(15))
+        # 候选类的 <clinit> 全部挂延迟断点（对未加载的类不报错、仅挂起），
+        # 哪个命中用哪个：优先 APK 自动定位，兑底硬编码候选
+        candidates = get_candidates()
+        for cls in candidates:
+            send_cmd(child, f"stop in {cls}.<clinit>", timeout=_vt(15))
 
         print("\n[*] resume")
         try:
@@ -932,17 +935,29 @@ def run_once():
                            timeout=_vt(90))
         if idx == len(BREAKPOINT_PATTERNS):
             raise Disconnected("等待断点期间 jdb 已退出（EOF）")
+        hit_cls = None
         if idx < len(BREAKPOINT_PATTERNS):
             print("\n[+] Breakpoint hit!")
             time.sleep(0.2)
+            seg = ""
             try:
                 child.expect(PROMPTS + [pexpect.TIMEOUT], timeout=5)
+                seg = child.before or ""
             except Exception:
                 pass
+            # 断点输出形如："线程=main", com.safe.cons.LynkCoConstants$f.<clinit>(),
+            # 行=1 bci=7——从命中输出解析实际命中的候选类
+            m = re.search(r"com\.safe\.cons\.LynkCoConstants\$\w+", seg)
+            if m and m.group(0) in candidates:
+                hit_cls = m.group(0)
+                print(f"[*] 命中密钥常量类: {hit_cls}")
+            else:
+                # 输出里没解析到类名时退回首选候选（同旧行为）
+                hit_cls = candidates[0]
             for i in range(15):
                 print(f"\n[*] next (step {i + 1})")
                 send_cmd(child, "next", timeout=_vt(15))
-                out = send_cmd(child, f"print {CLASS}.c", timeout=_vt(10))
+                out = send_cmd(child, f"print {hit_cls}.c", timeout=_vt(10))
                 val = parse_field(out)
                 print(f"    -> c probe: "
                       f"{'有值（' + str(len(val)) + ' 位）' if val else 'None'}")
@@ -951,10 +966,19 @@ def run_once():
         else:
             print("\n[!] 未命中断点（clinit 可能已提前执行），直接尝试打印字段 ...")
 
-        print("\n[*] Dumping fields b/c/d/e ...")
+        if hit_cls is None:
+            # 未命中断点时逐一候选探测字段，谁有值用谁
+            hit_cls = candidates[0]
+            for cls in candidates:
+                probe = send_cmd(child, f"print {cls}.c", timeout=_vt(10))
+                if parse_field(probe):
+                    hit_cls = cls
+                    break
+
+        print(f"\n[*] Dumping fields b/c/d/e of {hit_cls} ...")
         results = {}
         for field in ["b", "c", "d", "e"]:
-            results[field] = send_cmd(child, f"print {CLASS}.{field}",
+            results[field] = send_cmd(child, f"print {hit_cls}.{field}",
                                       timeout=_vt(10))
 
         print("\n" + "=" * 60)
@@ -977,6 +1001,92 @@ def run_once():
             adb("forward", "--remove", f"tcp:{UPSTREAM_PORT}")
         except Exception:
             pass
+
+
+def _scan_apk_for_key_classes(apk_path):
+    """扫描 APK 内 classes.dex 的明文字符串区，定位业务 dex 孤立引用的
+    密钥常量类（LynkCoConstants$X）。
+
+    加固壳把真实 dex 的字符串表明文存于 classes.dex 尾部 payload：定义区
+    里全部内部类名连续出现（相邻匹配间距约 35B）；而业务 dex 只会孤立
+    引用密钥类一处（相邻无同模式匹配）。后续版本内部类名再偏移也能自动
+    跟踪，无需改代码。"""
+    import zipfile
+    try:
+        with zipfile.ZipFile(apk_path) as z:
+            data = z.read("classes.dex")
+    except Exception:
+        return []
+    # 仅匹配小写字母开头的短混淆名（$a~$zz）；ModuleEvent/WeexUrl 等带
+    # 大写开头的具名内部类在业务 dex 中与密钥类相邻出现，必须排除，否则
+    # 会破坏孤立性判定
+    pat = re.compile(rb"Lcom/safe/cons/LynkCoConstants\$([a-z]{1,3});")
+    hits = [(m.start(), m.group(1).decode()) for m in pat.finditer(data)]
+    found = []
+    for i, (off, name) in enumerate(hits):
+        prev_off = hits[i - 1][0] if i > 0 else -(1 << 60)
+        next_off = hits[i + 1][0] if i + 1 < len(hits) else 1 << 60
+        # 定义区内相邻匹配间距 < 200B；孤立（两侧 1KB 内无同模式匹配）
+        # 的才是业务 dex 的引用点
+        if off - prev_off > 1000 and next_off - off > 1000 and name not in found:
+            found.append(name)
+    return [f"com.safe.cons.LynkCoConstants${n}" for n in found]
+
+
+def auto_detect_candidates():
+    """从设备已安装的领克 App 拉取 APK 自动定位密钥常量类，结果按版本号
+    缓存到工具目录（同版本只需拉一次）。失败返回 []，由调用方提示退出。"""
+    try:
+        info = adb("shell", "dumpsys", "package", APP)
+        m = re.search(r"versionName=([\w.\-]+)", info)
+        ver = m.group(1) if m else "unknown"
+        cache = os.path.join(TOOLS_DIR, f"keyclass-v{ver}.txt")
+        if os.path.exists(cache):
+            with open(cache) as f:
+                return [ln.strip() for ln in f if ln.strip()]
+        base = next((ln.split(":", 1)[1].strip()
+                     for ln in adb("shell", "pm", "path", APP).splitlines()
+                     if ln.strip()), "")
+        if not base:
+            return []
+        os.makedirs(TOOLS_DIR, exist_ok=True)
+        dest = os.path.join(TOOLS_DIR, f"base-v{ver}.apk")
+        print(f"[*] 拉取设备上的 APK 自动定位密钥常量类（v{ver}，约 285MB，"
+              f"同版本仅此一次）...")
+        r = subprocess.run([ADB, "pull", base, dest],
+                           capture_output=True, text=True)
+        if r.returncode != 0 or not os.path.exists(dest):
+            return []
+        cands = _scan_apk_for_key_classes(dest)
+        try:
+            os.remove(dest)
+        except OSError:
+            pass
+        if cands:
+            with open(cache, "w") as f:
+                f.write("\n".join(cands) + "\n")
+        return cands
+    except Exception as e:
+        print(f"[.] APK 自动定位未成功（退回内置候选）：{e}")
+        return []
+
+
+_auto_candidates = {"resolved": False, "list": []}
+
+
+def get_candidates():
+    """断点候选类列表：从 APK 自动定位；失败则提示后退出（不再维护
+    硬编码候选，避免版本升级后静默用错类）。"""
+    if not _auto_candidates["resolved"]:
+        _auto_candidates["list"] = auto_detect_candidates()
+        _auto_candidates["resolved"] = True
+    auto = _auto_candidates["list"]
+    if not auto:
+        sys.exit("[!] 未能从 APK 自动定位密钥常量类（设备拉取/扫描失败）。"
+                 "请检查 adb 连接后重跑；若壳的 payload 结构变化，"
+                 "需按文档第 1 节重新静态分析扫描规则。")
+    print(f"[*] APK 扫描定位密钥常量类：{', '.join(auto)}")
+    return auto
 
 
 def extract_main_loop():

@@ -102,7 +102,11 @@ def main():
     _ensure_device(adb)
     _ensure_apk(adb)
 
-    PKG, ACT, CLASS = core.APP, core.ACTIVITY, core.CLASS
+    PKG, ACT = core.APP, core.ACTIVITY
+    # 密钥常量类由 core 自动定位；adb 原生识别 ANDROID_SERIAL，
+    # 多设备下 core.adb 也能定位到 WSL 模拟器
+    os.environ["ANDROID_SERIAL"] = DEVICE
+    CLASS = core.get_candidates()[0]
     for attempt in range(1, core.MAX_ATTEMPTS + 1):
         print(f"\n========== 第 {attempt}/{core.MAX_ATTEMPTS} 次尝试 ==========",
               flush=True)

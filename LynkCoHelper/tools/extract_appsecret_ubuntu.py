@@ -84,7 +84,7 @@ def main():
     import pexpect
 
     ADB, JDB = core.ADB, core.JDB
-    PKG, ACT, CLASS = core.APP, core.ACTIVITY, core.CLASS
+    PKG, ACT = core.APP, core.ACTIVITY
 
     def adb(*a, t=25):
         # Windows 版脚本 connect 过 127.0.0.1:5555 后，本机 adb 可能同时
@@ -134,6 +134,12 @@ def main():
         else:
             apk = core.ensure_apk()   # 本地没有则走官方接口下载最新版
         print(adb("install", "-r", "-g", apk, t=600).strip())
+
+    # 密钥常量类由 core 自动定位（首跑拉 APK 扫描，同版本后续走缓存）。
+    # adb 原生识别 ANDROID_SERIAL，多设备下 core.adb 也能定位到目标设备
+    if serial[0]:
+        os.environ["ANDROID_SERIAL"] = serial[0]
+    CLASS = core.get_candidates()[0]
 
     # ---------- 3. 提取主循环 ----------
     for attempt in range(1, core.MAX_ATTEMPTS + 1):

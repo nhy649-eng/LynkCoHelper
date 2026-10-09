@@ -11,10 +11,11 @@ extract_all_constants.py —— 全量常量提取（v3：专攻 HttpSecretKey/G
 v3 流程（最小化调试暴露面，无单步）：
   1. 代理抢 JDWP 早期窗口握手（同 core.run_once）
   2. suspend 冻结 -> 设两个断点：
-     - com.safe.cons.LynkCoConstants$g.<clinit>（早期必命中，确认调试链路活着）
+     - 密钥常量类（core 自动定位，如 LynkCoConstants$f）.<clinit>
+       （早期必命中，确认调试链路活着）
      - com.haohan.module.http.encrypt.HttpSecretKey.<clinit>（延迟断点：
        类首次初始化时命中，即 App 首个 GRIC 请求签名前）
-  3. $g 断点命中后 clear 该断点 -> cont 放行
+  3. 哨兵断点命中后 clear 该断点 -> cont 放行
   4. 等 HttpSecretKey.<clinit> 命中（App 启动后数秒内发心跳即触发）
   5. 命中后：dump 该类 fields/methods，探测 getSecretKey 的调用形式
      （静态/实例/Companion），取返回值；再 cont 数秒 -> suspend -> 复取
@@ -243,9 +244,10 @@ def run_dump_once(results):
         # 设延迟断点：HttpSecretKey 类加载初始化时命中
         print(f"\n[*] 设延迟断点: {TARGET_CLASS}.<clinit>")
         core.send_cmd(child, f"stop in {TARGET_CLASS}.<clinit>", timeout=core._vt(15))
-        # 早期哨兵断点：$g clinit 必先命中，证明断点链路可用
-        print(f"[*] 设哨兵断点: {core.CLASS}.<clinit>")
-        core.send_cmd(child, f"stop in {core.CLASS}.<clinit>", timeout=core._vt(15))
+        # 早期哨兵断点：密钥常量类 clinit 必先命中，证明断点链路可用
+        key_cls = core.get_candidates()[0]
+        print(f"[*] 设哨兵断点: {key_cls}.<clinit>")
+        core.send_cmd(child, f"stop in {key_cls}.<clinit>", timeout=core._vt(15))
 
         print("\n[*] resume")
         try:
@@ -253,19 +255,19 @@ def run_dump_once(results):
         except OSError as e:
             raise core.Disconnected(f"jdb 进程已退出（{e}）")
 
-        # 第一阶段：等哨兵断点（$g clinit，秒级）
+        # 第一阶段：等哨兵断点（密钥常量类 clinit，秒级）
         idx = child.expect(core.BREAKPOINT_PATTERNS + [pexpect.EOF, pexpect.TIMEOUT],
                            timeout=core._vt(90))
         if idx == len(core.BREAKPOINT_PATTERNS):
             raise core.Disconnected("等待哨兵断点期间 jdb 已退出（EOF）")
         if idx < len(core.BREAKPOINT_PATTERNS):
-            print("\n[+] 哨兵断点命中（$g clinit），清除并放行 ...")
+            print(f"\n[+] 哨兵断点命中（{key_cls} clinit），清除并放行 ...")
             time.sleep(0.2)
             try:
                 child.expect(core.PROMPTS + [pexpect.TIMEOUT], timeout=5)
             except Exception:
                 pass
-            safe_cmd(child, f"clear {core.CLASS}.<clinit>", timeout=10)
+            safe_cmd(child, f"clear {key_cls}.<clinit>", timeout=10)
 
         # 第二阶段：cont 放行，等 HttpSecretKey.<clinit> 命中
         print(f"\n[*] cont -> 等待 {TARGET_CLASS}.<clinit> 命中（超时 {TARGET_BP_TIMEOUT}s）...")
