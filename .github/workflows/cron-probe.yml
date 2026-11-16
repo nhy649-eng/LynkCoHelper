@@ -1,0 +1,20 @@
+name: Cron Probe
+
+# 临时探针：用来验证本仓库的 schedule 事件是否还会触发。
+# 观察 30 分钟左右，若一次 run 都没出现，说明仓库级定时调度已失效，可以删掉本文件。
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Echo probe heartbeat
+        run: |
+          echo "probe ok at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "event=${{ github.event_name }} ref=${{ github.ref }} sha=${{ github.sha }}"
